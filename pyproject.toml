@@ -1,0 +1,38 @@
+[project]
+name = "reticker"
+version = "0.1.0"
+description = "Joint stochastic reconstruction of market tickers from minute candles"
+readme = "README.md"
+authors = [
+    { name = "Igor Smirnov", email = "smirnoviv@rambler.ru" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "catboost>=1.2.7,<2",
+    "clickhouse-driver>=0.2.9,<0.3",
+    "matplotlib>=3.9,<4",
+    "numpy>=2,<3",
+    "pandas>=2.2,<4",
+    "pyarrow>=18,<25",
+    "python-dotenv>=1,<2",
+]
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "ruff>=0.11,<1"]
+
+[project.scripts]
+reticker = "reticker:main"
+
+[build-system]
+requires = ["uv_build>=0.12.21,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
