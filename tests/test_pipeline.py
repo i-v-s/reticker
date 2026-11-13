@@ -3,6 +3,7 @@ import shutil
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import pytest
 
 from reticker import (
@@ -18,6 +19,7 @@ from reticker import (
 from reticker.cli import main
 from reticker.config import utc
 from reticker.generation import Simulation, reconstruct
+from reticker.io import json_safe
 from reticker.model import ResidualBank
 from reticker.statistics import acf, correlations, panel_matrix
 
@@ -81,17 +83,29 @@ def test_joint_blocks_preserve_persistence_and_cross_asset_dependence(fitted):
     assert correlations(j)[off_diagonal].mean() > correlations(i)[off_diagonal].mean() + 0.25
 
 
-def test_subset_and_parquet_output(fitted, market_data, tmp_path):
+@pytest.mark.parametrize("layout", [None, "single", "partitioned"])
+def test_subset_and_parquet_output(fitted, market_data, tmp_path, layout):
     source, _, bundle = fitted
     start = market_data[3]
     config = GenerationConfig(str(start), str(start + pd.Timedelta(minutes=7)), ("AAAUSDT",), 5)
-    result = write_generation(source, bundle, config, tmp_path / "output")
+    options = {} if layout is None else {"layout": layout}
+    result = write_generation(source, bundle, config, tmp_path / "output", **options)
     assert result["status"] == "complete" and result["rows"] == 14
+    assert result["layout"] == (layout or "single")
     files = list((tmp_path / "output").rglob("*.parquet"))
-    assert len(files) == 2
+    expected_files = (
+        {f"market={market}/date=2025-01-02/part-000000.parquet" for market in ("spot", "linear")}
+        if layout == "partitioned"
+        else {"tickers.parquet"}
+    )
+    assert {str(path.relative_to(tmp_path / "output")) for path in files} == expected_files
+    assert set(result["chunks"][0]["files"]) == expected_files
     data = pd.concat([pd.read_parquet(path) for path in files])
     assert set(data.symbol) == {"AAAUSDT"}
     assert data.time.dt.tz is not None
+    assert data.attrs == {}
+    assert data.loc[data.category == "spot", "prev_price1h"].isna().all()
+    assert data.loc[data.category == "spot", ["mark_price", "index_price"]].isna().all().all()
     assert json.loads((tmp_path / "output/manifest.json").read_text())["config"]["seed"] == 5
     with pytest.raises(RetickerError, match="trained subset"):
         list(
@@ -103,6 +117,154 @@ def test_subset_and_parquet_output(fitted, market_data, tmp_path):
                 ),
             )
         )
+
+
+@pytest.mark.parametrize("layout", ["single", "partitioned"])
+def test_parquet_output_spans_chunks_and_dates(fitted, market_data, tmp_path, layout):
+    source, _, bundle = fitted
+    start = market_data[3]
+    config = GenerationConfig(str(start), str(start + pd.Timedelta(minutes=1450)), ("AAAUSDT",), 5)
+    frames = list(generate(source, bundle, config))
+    expected = pd.concat(frames, ignore_index=True)
+    expected.attrs = {}
+    output = tmp_path / "output"
+    result = write_generation(source, bundle, config, output, layout=layout)
+    assert result["status"] == "complete" and result["rows"] == 2900
+    assert len(result["chunks"]) == 2
+    for chunk, frame in zip(result["chunks"], frames, strict=True):
+        for key in ("source_sha256", "diagnostics", "candle_quality"):
+            assert chunk[key] == frame.attrs[key]
+    files = list(output.rglob("*.parquet"))
+    if layout == "single":
+        assert files == [output / "tickers.parquet"]
+        assert all(chunk["files"] == ["tickers.parquet"] for chunk in result["chunks"])
+        parquet = pq.ParquetFile(files[0])
+        assert parquet.metadata.num_row_groups == 2
+        assert parquet.metadata.row_group(0).column(0).compression == "ZSTD"
+    else:
+        assert len(files) == 6
+        assert (output / "market=spot/date=2025-01-03/part-000000.parquet").is_file()
+        assert (output / "market=spot/date=2025-01-03/part-000001.parquet").is_file()
+    # Read file contents without adding Hive partition columns from their parent paths.
+    actual = pd.concat(
+        [pq.ParquetFile(path).read().to_pandas() for path in files], ignore_index=True
+    )
+    actual.attrs = {}
+    keys = ["time", "category", "symbol"]
+    pd.testing.assert_frame_equal(
+        actual.sort_values(keys).reset_index(drop=True),
+        expected.sort_values(keys).reset_index(drop=True),
+        check_exact=True,
+    )
+    assert json.loads((output / "manifest.json").read_text()) == json_safe(result)
+
+
+@pytest.mark.parametrize("layout", ["single", "partitioned"])
+def test_generation_failure_keeps_written_chunk(fitted, market_data, tmp_path, monkeypatch, layout):
+    source, _, bundle = fitted
+    start = market_data[3]
+    config = GenerationConfig(str(start), str(start + pd.Timedelta(minutes=7)), ("AAAUSDT",), 5)
+    frame = next(generate(source, bundle, config))
+    output = tmp_path / "output"
+
+    def interrupted(*args):
+        yield frame
+        running = json.loads((output / "manifest.json").read_text())
+        assert running["status"] == "running" and running["rows"] == len(frame)
+        assert list(output.rglob("*.parquet"))
+        raise RetickerError("Generation interrupted")
+
+    monkeypatch.setattr("reticker.generation.generate", interrupted)
+    with pytest.raises(RetickerError, match="Generation interrupted"):
+        write_generation(source, bundle, config, output, layout=layout)
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert manifest["status"] == "failed" and manifest["error"] == "Generation interrupted"
+    assert manifest["rows"] == len(frame) and len(manifest["chunks"]) == 1
+    data = pd.concat(
+        [pq.ParquetFile(path).read().to_pandas() for path in output.rglob("*.parquet")]
+    )
+    pd.testing.assert_frame_equal(
+        data.sort_values(["time", "category", "symbol"]).reset_index(drop=True),
+        frame.reset_index(drop=True),
+        check_exact=True,
+    )
+
+
+def test_parquet_close_failure_marks_run_failed(fitted, market_data, tmp_path, monkeypatch):
+    source, _, bundle = fitted
+    start = market_data[3]
+    config = GenerationConfig(str(start), str(start + pd.Timedelta(minutes=7)))
+    output = tmp_path / "output"
+    close = pq.ParquetWriter.close
+
+    def failed_close(writer):
+        assert json.loads((output / "manifest.json").read_text())["status"] == "running"
+        close(writer)
+        raise OSError("Cannot finalize Parquet")
+
+    monkeypatch.setattr(pq.ParquetWriter, "close", failed_close)
+    with pytest.raises(OSError, match="Cannot finalize Parquet"):
+        write_generation(source, bundle, config, output)
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert manifest["status"] == "failed" and manifest["error"] == "OSError"
+
+
+def test_invalid_generation_layout_does_not_create_output(tmp_path):
+    output = tmp_path / "output"
+    with pytest.raises(RetickerError, match="layout"):
+        write_generation(
+            None, None, GenerationConfig("2025-01-01", "2025-01-02"), output, layout="daily"
+        )
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("layout", [None, "partitioned"])
+def test_cli_generation_layout(fitted, market_data, tmp_path, monkeypatch, capsys, layout):
+    source, _, bundle = fitted
+    start = market_data[3]
+    output = tmp_path / "output"
+    monkeypatch.setattr("reticker.cli.ClickHouseSource.from_env", lambda env_file: source)
+    args = [
+        "generate",
+        "--model",
+        str(bundle.path),
+        "--start",
+        str(start),
+        "--end",
+        str(start + pd.Timedelta(minutes=7)),
+        "--out",
+        str(output),
+    ]
+    if layout is not None:
+        args += ["--layout", layout]
+    assert main(args) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "complete"
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert manifest["layout"] == (layout or "single")
+    assert len(list(output.rglob("*.parquet"))) == (2 if layout == "partitioned" else 1)
+
+
+def test_cli_rejects_unknown_generation_layout(tmp_path, capsys):
+    output = tmp_path / "output"
+    with pytest.raises(SystemExit) as exc:
+        main(
+            [
+                "generate",
+                "--model",
+                "unused",
+                "--start",
+                "2025-01-01",
+                "--end",
+                "2025-01-02",
+                "--out",
+                str(output),
+                "--layout",
+                "daily",
+            ]
+        )
+    assert exc.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
+    assert not output.exists()
 
 
 def test_evaluation_reports_and_intervals(fitted, tmp_path):

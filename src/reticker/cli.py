@@ -61,6 +61,12 @@ def parser():
     command.add_argument("--end", required=True)
     command.add_argument("--seed", type=int, default=42)
     command.add_argument("--chunk-days", type=int, default=1)
+    command.add_argument(
+        "--layout",
+        choices=("single", "partitioned"),
+        default="single",
+        help="Parquet layout: one file (default) or market/date partitions",
+    )
     command.add_argument("--out", required=True)
     return root
 
@@ -149,7 +155,11 @@ def main(argv=None):
                 args.chunk_days,
             )
             result = write_generation(
-                ClickHouseSource.from_env(args.env_file), bundle, config, args.out
+                ClickHouseSource.from_env(args.env_file),
+                bundle,
+                config,
+                args.out,
+                layout=args.layout,
             )
             print(
                 json.dumps(

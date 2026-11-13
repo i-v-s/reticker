@@ -1,10 +1,13 @@
 """Stateful joint generation; chunk boundaries do not reset bootstrap or RNG state."""
 
 import hashlib
+from contextlib import ExitStack
 from dataclasses import asdict
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from .config import GenerationConfig, RetickerError, Selection, minute_range, new_directory
 from .dataset import DERIVED, candle_features, targets
@@ -204,12 +207,16 @@ def generate(source, bundle, config: GenerationConfig):
             pending = []
 
 
-def write_generation(source, bundle, config, output_dir):
+def write_generation(source, bundle, config, output_dir, *, layout="single"):
+    """Stream Parquet to one file or market/date partitions, with a run manifest."""
+    if layout not in {"single", "partitioned"}:
+        raise RetickerError("Unknown generation layout; use single or partitioned")
     bundle = bundle if isinstance(bundle, ModelBundle) else ModelBundle.load(bundle)
     path = new_directory(output_dir)
     manifest = {
         "format_version": 1,
         "status": "running",
+        "layout": layout,
         "model_id": bundle.manifest["model_id"],
         "config": asdict(config),
         "metadata": bundle.manifest["metadata"],
@@ -219,29 +226,48 @@ def write_generation(source, bundle, config, output_dir):
     }
     write_json(path / "manifest.json", manifest)
     try:
-        for index, frame in enumerate(generate(source, bundle, config)):
-            files = []
-            for (market, date), part in frame.groupby(
-                ["category", frame.time.dt.strftime("%Y-%m-%d")]
-            ):
-                directory = path / f"market={market}" / f"date={date}"
-                directory.mkdir(parents=True, exist_ok=True)
-                file = directory / f"part-{index:06d}.parquet"
-                # ndarray attrs are for in-process evaluation, not Parquet metadata.
-                part = part.copy()
-                part.attrs = {}
-                part.to_parquet(file, index=False, compression="zstd")
-                files.append(str(file.relative_to(path)))
-            manifest["rows"] += len(frame)
-            manifest["chunks"].append(
-                {
-                    "files": files,
-                    "source_sha256": frame.attrs["source_sha256"],
-                    "diagnostics": frame.attrs["diagnostics"],
-                    "candle_quality": frame.attrs["candle_quality"],
-                }
-            )
-            write_json(path / "manifest.json", manifest)
+        with ExitStack() as stack:
+            writer = None
+            for index, frame in enumerate(generate(source, bundle, config)):
+                files = []
+                if layout == "single":
+                    part = frame.copy(deep=False)
+                    part.attrs = {}
+                    table = pa.Table.from_pandas(
+                        part,
+                        schema=writer.schema if writer is not None else None,
+                        preserve_index=False,
+                    )
+                    if writer is None:
+                        writer = stack.enter_context(
+                            pq.ParquetWriter(
+                                path / "tickers.parquet", table.schema, compression="zstd"
+                            )
+                        )
+                    writer.write_table(table)
+                    files.append("tickers.parquet")
+                else:
+                    for (market, date), part in frame.groupby(
+                        ["category", frame.time.dt.strftime("%Y-%m-%d")]
+                    ):
+                        directory = path / f"market={market}" / f"date={date}"
+                        directory.mkdir(parents=True, exist_ok=True)
+                        file = directory / f"part-{index:06d}.parquet"
+                        # ndarray attrs are for in-process evaluation, not Parquet metadata.
+                        part = part.copy()
+                        part.attrs = {}
+                        part.to_parquet(file, index=False, compression="zstd")
+                        files.append(str(file.relative_to(path)))
+                manifest["rows"] += len(frame)
+                manifest["chunks"].append(
+                    {
+                        "files": files,
+                        "source_sha256": frame.attrs["source_sha256"],
+                        "diagnostics": frame.attrs["diagnostics"],
+                        "candle_quality": frame.attrs["candle_quality"],
+                    }
+                )
+                write_json(path / "manifest.json", manifest)
     except Exception as exc:
         manifest.update(
             status="failed",

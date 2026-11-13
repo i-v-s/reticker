@@ -81,13 +81,29 @@ uv run reticker generate \
 | `prepare` | Зафиксированная общая выборка `panel.parquet`, качество данных и временные разбиения |
 | `train` | CatBoost-модели, банк остатков, метаданные, параметры и контрольные суммы |
 | `evaluate` | `report.md`, полный `report.json` и `diagnostics.png`; по умолчанию 20 seed |
-| `generate` | Parquet по `market=.../date=...`, манифест запуска и диагностика каждой порции |
+| `generate` | Один `tickers.parquet` по умолчанию или Parquet по `market=.../date=...`; манифест запуска и диагностика каждой порции |
 
 Артефакт фиксирует набор рынков. Для генерации можно выбирать любой обученный
 поднабор символов; для другого набора рынков нужно обучить отдельный артефакт.
 Параметр `generate --markets`, если передан, проверяется на соответствие артефакту.
 
 Многолетняя генерация идёт порциями (`--chunk-days`, по умолчанию 1).
+Параметр `--layout single|partitioned` задаёт структуру файлов независимо от размера
+порции. По умолчанию `single` последовательно записывает все дни, рынки и символы
+в `tickers.parquet`, без накопления всего периода в памяти. Для прежнего разбиения
+по рынкам и календарным дням UTC укажите `--layout partitioned`. В обоих режимах
+`--out` — каталог с данными и `manifest.json`.
+
+```sh
+# Один файл: artifacts/generated/tickers.parquet
+uv run reticker generate --model artifacts/model \
+  --start 2026-11-08 --end 2026-11-09 --out artifacts/generated --layout single
+
+# Файлы market=.../date=.../part-*.parquet
+uv run reticker generate --model artifacts/model \
+  --start 2026-11-08 --end 2026-11-09 --out artifacts/partitioned --layout partitioned
+```
+
 Окна признаков, RNG и текущий блок сохраняются между порциями: одинаковые
 входы, артефакт и seed дают одинаковые значения при разном размере порций.
 Это не обещает одинаковую реализацию при изменении набора символов.
@@ -156,7 +172,18 @@ for frame in generate(
 В DataFrame времени нужны UTC datetime, имена столбцов совпадают с источником.
 Сохранённые объекты загружаются через `PreparedDataset.load(path)` и
 `ModelBundle.load(path)` с проверкой контрольных сумм. Для потокового сохранения
-служит `write_generation(source, model, config, output_dir)`.
+служит `write_generation(source, model, config, output_dir, *, layout="single")`.
+Аргумент `layout="partitioned"` включает разбиение по рынкам и дням. Единый файл
+можно прочитать обычным вызовом:
+
+```python
+data = pd.read_parquet("artifacts/generated/tickers.parquet")
+```
+
+Манифест содержит выбранный `layout` и диагностику каждой порции. В режиме
+`single` поле `files` всех порций ссылается на один `tickers.parquet`:
+читать его нужно один раз. Статус `complete` устанавливается после закрытия
+Parquet-файла; при ошибке остаётся статус `failed` и частичный результат.
 
 ## Данные и выходные поля
 
